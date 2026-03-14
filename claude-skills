@@ -1,0 +1,110 @@
+#!/bin/bash
+set -e
+
+# --- Check for git ---
+if ! command -v git >/dev/null 2>&1; then
+    echo "WARNING: Git is not installed. Skills cloning/pulling steps will be skipped."
+    SKIP_GIT=true
+else
+    SKIP_GIT=false
+fi
+
+# --- Configuration ---
+CLAUDE_BASE="/opt/claude/skills"
+REPOS=(
+    "core|git@git.internal:ai/claude-core-skills.git"
+    "vendor|git@git.internal:ai/claude-vendor-skills.git"
+    "internal|git@git.internal:ai/claude-internal-skills.git"
+)
+CRON_INTERVAL="*/5 * * * *"
+
+# --- Create directories ---
+sudo mkdir -p $CLAUDE_BASE
+sudo chown -R root:root $CLAUDE_BASE
+sudo chmod -R 755 $CLAUDE_BASE
+
+# --- Clone or update repos (if git exists) ---
+if [ "$SKIP_GIT" = false ]; then
+    for repo_entry in "${REPOS[@]}"; do
+        IFS='|' read -r name url <<< "$repo_entry"
+        REPO_PATH="$CLAUDE_BASE/$name"
+
+        if [ ! -d "$REPO_PATH" ]; then
+            echo "Cloning $name..."
+            sudo git clone "$url" "$REPO_PATH"
+        else
+            echo "Repo $name exists, skipping clone"
+        fi
+
+        # Ensure safe permissions
+        sudo chown -R root:root "$REPO_PATH"
+        sudo chmod -R 755 "$REPO_PATH"
+
+        # --- Setup cron job for auto-update ---
+        CRON_CMD="cd $REPO_PATH && git fetch --all && git reset --hard origin/main"
+        (sudo crontab -l 2>/dev/null | grep -F "$CRON_CMD") || \
+        (sudo crontab -l 2>/dev/null; echo "$CRON_INTERVAL $CRON_CMD") | sudo crontab -
+    done
+else
+    echo "Skipping git clone/pull steps."
+fi
+
+echo "Claude skills installation complete."
+
+
+
+# --- Check for Git ---
+try {
+    git --version | Out-Null
+    $SkipGit = $false
+} catch {
+    Write-Warning "Git is not installed. Skills cloning/pulling steps will be skipped."
+    $SkipGit = $true
+}
+
+# --- Configuration ---
+$BasePath = "C:\Claude\skills"
+$Repos = @{
+    "core" = "git@git.internal:ai/claude-core-skills.git"
+    "vendor" = "git@git.internal:ai/claude-vendor-skills.git"
+    "internal" = "git@git.internal:ai/claude-internal-skills.git"
+}
+$TaskNamePrefix = "ClaudeSkillsUpdate"
+
+# --- Create directories ---
+New-Item -ItemType Directory -Force -Path $BasePath | Out-Null
+
+if (-not $SkipGit) {
+    # --- Clone or ensure repos ---
+    foreach ($name in $Repos.Keys) {
+        $repoPath = Join-Path $BasePath $name
+        $repoUrl = $Repos[$name]
+
+        if (!(Test-Path $repoPath)) {
+            Write-Host "Cloning $name..."
+            git clone $repoUrl $repoPath
+        } else {
+            Write-Host "$name already exists, skipping clone"
+        }
+
+        # Optional: Set permissions to admin-only
+        $acl = Get-Acl $repoPath
+        $acl.SetAccessRuleProtection($true, $false)
+        Set-Acl $repoPath $acl
+
+        # --- Create scheduled task for auto-update ---
+        $Action = New-ScheduledTaskAction -Execute "git" -Argument "-C `"$repoPath`" fetch --all && git reset --hard origin/main"
+        $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
+        $TaskName = "$TaskNamePrefix-$name"
+
+        # Register or replace existing task
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        }
+        Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -RunLevel Highest -Force
+    }
+} else {
+    Write-Warning "Skipping git clone/pull steps."
+}
+
+Write-Host "Claude skills installation complete."

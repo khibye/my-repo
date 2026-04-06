@@ -1,0 +1,325 @@
+To generalize this architecture for **any number of databases, any SQL dialect**, and to **future-proof it for Trino**, we must shift from a hardcoded approach to a **Config-Driven Registry Pattern**. 
+
+Instead of writing `pg_node` and `mysql_node`, you will define a list of database configurations. The code will dynamically generate the LangGraph nodes, wire the edges, construct the Supervisor's prompt, and manage the SQLAlchemy engines.
+
+Here is the ultimate, dynamic architecture.
+
+### 1. The Database Registry & Engine Manager
+First, define a configuration model for your databases and set up a dictionary to cache your SQLAlchemy engines.
+
+```python
+from dataclasses import dataclass
+from sqlalchemy import create_engine, text
+from typing import Dict, Any
+
+@dataclass
+class DatabaseConfig:
+    db_id: str
+    sqlalchemy_uri: str
+    description: str # CRITICAL: This teaches the supervisor what is in the DB.
+
+# 1. Define your data sources (You can load this from a YAML or JSON file)
+DB_REGISTRY = [
+    DatabaseConfig(
+        db_id="user_db", 
+        sqlalchemy_uri="postgresql+psycopg2://user:pass@host/users",
+        description="Contains User profiles, emails, and demographics."
+    ),
+    DatabaseConfig(
+        db_id="billing_db", 
+        sqlalchemy_uri="mysql+pymysql://user:pass@host/billing",
+        description="Contains Invoices, payments, and subscription tiers."
+    ),
+    # Add as many as you want... SQLite, SQL Server, Oracle, etc.
+]
+
+# 2. Cache SQLAlchemy Engines so we don't open connections on every query
+ENGINES = {
+    db.db_id: create_engine(db.sqlalchemy_uri) for db in DB_REGISTRY
+}
+```
+
+### 2. Universal SQLAlchemy Tools
+Because you are using SQLAlchemy, we can write **one set of tools** that work across almost any relational database. We use parameterized queries (`:term`) to prevent SQL injection and ensure cross-dialect compatibility.
+
+```python
+from langchain_core.tools import tool
+from sqlalchemy.exc import SQLAlchemyError
+
+@tool
+def execute_sql(db_id: str, query: str) -> str:
+    """Executes a SQL query on a specific db_id and returns the results."""
+    if db_id not in ENGINES:
+        return f"Error: Database {db_id} not found."
+    
+    try:
+        with ENGINES[db_id].connect() as conn:
+            # Using text() ensures SQLAlchemy handles dialect nuances
+            result = conn.execute(text(query)) 
+            rows = result.fetchmany(50)  # Hard limit to protect LLM context window
+            return str([dict(row._mapping) for row in rows])
+    except SQLAlchemyError as e:
+        return f"SQL Error: {str(e)}"
+
+@tool
+def search_needle_in_haystack(db_id: str, table_name: str, column_name: str, search_term: str) -> str:
+    """Use this to find exact spellings or IDs before writing complex SQL. Uses LIKE under the hood."""
+    if db_id not in ENGINES:
+        return f"Error: Database {db_id} not found."
+    
+    try:
+        # We construct the structural parts safely, and parameterize the search term
+        query = text(f"SELECT * FROM {table_name} WHERE {column_name} LIKE :term LIMIT 10")
+        with ENGINES[db_id].connect() as conn:
+            result = conn.execute(query, {"term": f"%{search_term}%"})
+            rows = result.fetchall()
+            return str([dict(row._mapping) for row in rows])
+    except SQLAlchemyError as e:
+        return f"Search Error: {str(e)}"
+
+# Define the master tool list passed to ALL dynamic workers
+DB_TOOLS = [execute_sql, search_needle_in_haystack] 
+```
+*(Note: I omitted `get_db_schema` for brevity, but you can build it using SQLAlchemy's `inspect(engine)` to fetch tables dynamically).*
+
+### 3. Dynamic Worker Factory
+We create a single function that dynamically spins up a ReAct agent tied to a specific `db_config`.
+
+```python
+from langgraph.prebuilt import create_react_agent
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+def create_worker_node(db_config: DatabaseConfig):
+    """Factory function to create a LangGraph node for a specific database."""
+    
+    system_prompt = f"""You are a specialized SQL assistant for database ID: {db_config.db_id}.
+    Database contents: {db_config.description}
+    
+    Rules:
+    1. ALWAYS pass '{db_config.db_id}' as the db_id argument to your tools.
+    2. Use search_needle_in_haystack if searching for text (names, companies) to find exact IDs.
+    3. Execute SQL and return the final data to the supervisor.
+    """
+    
+    agent = create_react_agent(llm, DB_TOOLS, state_modifier=system_prompt)
+    
+    # We wrap the agent in a standard Node function signature
+    def node_func(state):
+        result = agent.invoke({"messages": [state["messages"][-1]]})
+        return {"messages": [result["messages"][-1]]}
+        
+    return node_func
+```
+
+### 4. Dynamic Supervisor
+The Supervisor needs to know about the registered databases. We generate its prompt dynamically by looping through `DB_REGISTRY`.
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import AIMessage
+from pydantic import BaseModel, Field
+
+# Generate dynamic prompt based on config
+db_descriptions = "\n".join([f"- {db.db_id}: {db.description}" for db in DB_REGISTRY])
+valid_nodes = [f"worker_{db.db_id}" for db in DB_REGISTRY] + ["FINISH"]
+
+supervisor_system_prompt = f"""You are a Multi-Database Data Orchestrator.
+You have access to the following databases:
+{db_descriptions}
+
+Your job is to answer user questions. 
+If a question requires cross-referencing databases (e.g., getting an ID from user_db to query billing_db):
+1. Route to the first worker.
+2. Once it returns the data, route to the next worker, passing the retrieved data in the instructions.
+
+When you have the final answer, route to 'FINISH' and output the answer.
+Valid next_node values are: {', '.join(valid_nodes)}
+"""
+
+class RouteDecision(BaseModel):
+    next_node: str = Field(description=f"Must be one of: {', '.join(valid_nodes)}")
+    instructions: str = Field(description="Instructions for the worker. Pass retrieved data here if cross-referencing.")
+
+supervisor_chain = ChatPromptTemplate.from_messages([
+    ("system", supervisor_system_prompt),
+    ("placeholder", "{messages}")
+]) | llm.with_structured_output(RouteDecision)
+
+def supervisor_node(state):
+    decision = supervisor_chain.invoke(state)
+    return {
+        "next_node": decision.next_node,
+        "messages": [AIMessage(content=f"Routing to {decision.next_node}. Instructions: {decision.instructions}")]
+    }
+```
+
+### 5. Dynamic Graph Compilation
+Finally, we build the graph using a `for` loop over our registry. If you add 10 new databases to the list tomorrow, **you do not have to touch this code.**
+
+```python
+from langgraph.graph import StateGraph, END
+# (Assume MultiDBState is defined exactly as in the previous answer)
+
+builder = StateGraph(MultiDBState)
+builder.add_node("supervisor", supervisor_node)
+
+# We map node strings to nodes for dynamic routing
+route_map = {"FINISH": END}
+
+# Dynamically add worker nodes and edges
+for db in DB_REGISTRY:
+    node_name = f"worker_{db.db_id}"
+    
+    # Add the node
+    builder.add_node(node_name, create_worker_node(db))
+    
+    # Worker always reports back to supervisor
+    builder.add_edge(node_name, "supervisor")
+    
+    # Register in route map for conditional edges
+    route_map[node_name] = node_name
+
+# Supervisor routes dynamically based on its decision
+builder.add_conditional_edges(
+    "supervisor",
+    lambda state: state["next_node"],
+    route_map
+)
+
+builder.set_entry_point("supervisor")
+multi_db_graph = builder.compile()
+```
+
+---
+
+### Why this is Future-Proofed for Trino
+Trino is a federated SQL engine. It acts as a single endpoint but allows you to query across multiple databases using standard SQL (e.g., `SELECT * FROM mysql_catalog.billing JOIN pg_catalog.users...`).
+
+When you are ready to upgrade to Trino, **you do not need to change the LangGraph architecture.** You simply update your `DB_REGISTRY`:
+
+```python
+DB_REGISTRY = [
+    DatabaseConfig(
+        db_id="trino_master", 
+        sqlalchemy_uri="trino://user@trino-host:8080/default",
+        description="""Contains ALL company data.
+        Tables are prefixed by catalog: 
+        - pg_catalog.users for user data
+        - mysql_catalog.billing for billing data.
+        You can JOIN across these directly!"""
+    )
+]
+```
+
+Because the graph builds dynamically, your application will seamlessly compile into a **single Supervisor + single Trino Worker** setup. The Supervisor will automatically realize it has access to all data via one node, and will instruct the Trino worker to do cross-database joins natively, completely bypassing the need for the LLM to pass state back and forth!
+
+
+You have hit on the exact reason why Trino is so powerful—and why transitioning to it requires a slight mental shift in how you design your AI agents.
+
+When you upgrade to Trino, **the bottleneck is no longer the database connections; the bottleneck is the LLM's context window.** 
+
+If you hook a standard LLM agent up to Trino, and Trino is connected to PostgreSQL, MySQL, SQL Server, and an S3 Data Lake, Trino will present a massive unified schema containing thousands of tables. If you tell the LLM to "figure it out," it will crash due to context limits.
+
+Here is how you adapt the Supervisor-Worker architecture for Trino. 
+
+### The Mental Shift: From "Connection Routing" to "Context Routing"
+
+In the previous architecture, workers were isolated by **physical database engines**. 
+With Trino, workers are isolated by **Trino Catalogs (Business Domains)**, but they all share the *exact same connection endpoint*.
+
+#### 1. How Trino Organizes Data
+Trino queries use a 3-tier structure: `catalog.schema.table`.
+*   Postgres users table: `pg_catalog.public.users`
+*   MySQL billing table: `mysql_catalog.default.invoices`
+
+Because Trino understands both, you can write:
+```sql
+SELECT u.name, i.amount 
+FROM pg_catalog.public.users u 
+JOIN mysql_catalog.default.invoices i ON u.id = i.user_id
+```
+
+#### 2. How the LangGraph Architecture Adapts
+
+Instead of creating a "Postgres connection worker" and a "MySQL connection worker", you create **Domain-Specific Trino Workers**. 
+
+You configure your registry like this:
+
+```python
+# The URI is exactly the same for all of them!
+TRINO_URI = "trino://user@trino-host:8080/system"
+
+TRINO_DOMAIN_REGISTRY = [
+    {
+        "domain_id": "hr_data_expert",
+        "trino_catalogs_allowed": ["pg_catalog"],
+        "description": "Expert in HR and User data. Queries the 'pg_catalog' in Trino.",
+    },
+    {
+        "domain_id": "finance_data_expert",
+        "trino_catalogs_allowed": ["mysql_catalog"],
+        "description": "Expert in Billing and Invoices. Queries the 'mysql_catalog' in Trino.",
+    },
+    {
+        "domain_id": "cross_domain_analyst",
+        "trino_catalogs_allowed": ["pg_catalog", "mysql_catalog"],
+        "description": "Use ONLY when the user asks a question requiring both User data and Billing data. Knows how to JOIN across catalogs.",
+    }
+]
+```
+
+### 3. How the Supervisor orchestrates this
+
+Because Trino does the heavy lifting of joining the data natively, **the Supervisor no longer needs to pass IDs (state) back and forth between workers.** 
+
+Instead, the Supervisor becomes a pure **Context Router**. 
+
+1.  **User asks:** *"How much did John Doe pay?"*
+2.  **Supervisor thinks:** *"This requires User data and Billing data. I will route this to the `cross_domain_analyst`."*
+3.  **Cross-Domain Worker:** Given its specific prompt, it uses the Trino connection to query the schema for just the relevant tables in both catalogs, writes the `JOIN` statement natively in Trino SQL, and returns the final answer.
+
+### 4. Code Implementation for Trino
+
+Notice how we only initialize **one** SQLAlchemy engine, but we still create multiple LangGraph workers to protect the LLM's context window.
+
+```python
+from sqlalchemy import create_engine
+
+# 1. ONE Connection Engine
+trino_engine = create_engine("trino://user@localhost:8080/system")
+
+@tool
+def execute_trino_sql(query: str) -> str:
+    """Executes SQL against the unified Trino engine."""
+    with trino_engine.connect() as conn:
+        result = conn.execute(text(query))
+        return str([dict(row._mapping) for row in result.fetchmany(50)])
+
+def create_trino_domain_worker(domain_config: dict):
+    """Creates a worker that uses the shared Trino engine, but is artificially restricted in context."""
+    
+    # We restrict the LLM's focus so it doesn't get overwhelmed by the massive Trino schema
+    system_prompt = f"""You are a Trino SQL expert for the {domain_config['domain_id']} domain.
+    You only focus on these Trino catalogs: {domain_config['trino_catalogs_allowed']}.
+    
+    Rules for Trino SQL:
+    1. ALWAYS use the fully qualified name: catalog.schema.table
+    2. If joining across catalogs, ensure you prefix both tables properly.
+    """
+    
+    # All workers get the exact same execute_trino_sql tool!
+    return create_react_agent(llm, [execute_trino_sql], state_modifier=system_prompt)
+```
+
+### Summary of the Evolution
+
+| Feature | Pre-Trino Architecture | Post-Trino Architecture |
+| :--- | :--- | :--- |
+| **Connections** | Multiple separate SQLAlchemy engines. | ONE SQLAlchemy engine (Trino). |
+| **Worker Identity** | Tied to a specific physical Database. | Tied to a Business Domain (Catalogs). |
+| **Cross-DB Joins** | **Done in Python/LLM State.** Supervisor gets an ID from Worker A, passes it to Worker B. | **Done in Trino natively.** Supervisor routes to a "Federated Join Worker" that writes a single cross-catalog SQL query. |
+| **Why use LangGraph?**| To manage isolated DB connections and stitch data together. | To manage **Schema Context Limits**, so the LLM doesn't have to read 5,000 tables at once to write a query. |
+
+By building the dynamic configuration registry we discussed in the previous answer, transitioning to Trino later is as simple as updating your `DB_REGISTRY` to the Trino Domain mapping above. The LangGraph routing logic remains completely identical!
